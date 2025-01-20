@@ -1,0 +1,251 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# 自定义数据集类
+class PageLayoutDataset(Dataset):
+    def __init__(self, data, labels, transform=None):
+        self.data = data
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        label = self.labels[idx]
+        if self.transform:
+            sample = self.transform(sample)
+        return sample, label
+
+
+# 生成器模型
+class TGANGenerator(nn.Module):
+    def __init__(self, latent_dim=100, label_dim=50, output_channels=1):
+        super(TGANGenerator, self).__init__()
+        # 输入维度是 latent_dim + label_dim，将其映射到 320 维度并使用 LeakyReLU 激活函数
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim + label_dim, 320),
+            nn.LeakyReLU(0.2)
+        )
+        self.reshape = nn.Unflatten(1, (320, 1, 1))
+        # 多头注意力机制，这里使用 8 个头，嵌入维度为 320
+        self.attention = nn.MultiheadAttention(embed_dim=320, num_heads=8)
+        # 两层 Transformer 编码器层，每个层有 8 个头
+        self.transformer_block = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(320, nhead=8),
+            num_layers=2
+        )
+        self.flatten = nn.Flatten()
+        # 反卷积层，将特征图逐步转换为所需的图像尺寸
+        self.deconv_layers = nn.Sequential(
+            nn.ConvTranspose2d(320, 128, kernel_size=4, stride=1, padding=0),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose2d(64, output_channels, kernel_size=4, stride=2, padding=1),
+            nn.Tanh()
+        )
+
+    def forward(self, noise, label):
+        # 将噪声和标签拼接在一起
+        x = torch.cat([noise, label], dim=1)
+        # 全连接层
+        x = self.fc(x)
+        # 重塑形状
+        x = self.reshape(x)
+        # 多头注意力机制
+        x, _ = self.attention(x, x, x)
+        # Transformer 编码器层
+        x = self.transformer_block(x)
+        # 展平张量
+        x = self.flatten(x)
+        # 重塑形状，准备输入反卷积层
+        x = x.unsqueeze(2).unsqueeze(3)
+        # 反卷积层生成图像
+        x = self.deconv_layers(x)
+        return x
+
+
+# 判别器模型
+class TGANDiscriminator(nn.Module):
+    def __init__(self, label_dim=50):
+        super(TGANDiscriminator, self).__init__()
+        # 嵌入层，将标签嵌入到 label_dim 维度
+        self.embedding = nn.Embedding(num_embeddings=10, embedding_dim=label_dim)
+        # 将嵌入的标签映射到 224 * 224 维度
+        self.fc = nn.Sequential(
+            nn.Linear(label_dim, 224 * 224),
+            nn.LeakyReLU(0.2)
+        )
+        # 多头注意力机制，这里使用 8 个头，嵌入维度为 224 * 224
+        self.attention = nn.MultiheadAttention(embed_dim=224 * 224, num_heads=8)
+        # 卷积层序列，用于判别图像真伪
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(128, 1, kernel_size=4, stride=1, padding=0),
+            nn.Sigmoid()
+        )
+
+    def forward(self, image, label):
+        # 嵌入标签
+        embedded_label = self.embedding(label)
+        # 全连接层将嵌入标签转换为所需形状
+        x = self.fc(embedded_label).view(-1, 1, 224, 224)
+        # 将图像和嵌入标签拼接在一起
+        x = torch.cat([image, x], dim=1)
+        # 重塑形状，准备输入多头注意力机制
+        x = x.view(x.size(0), x.size(1), -1)
+        # 多头注意力机制
+        x, _ = self.attention(x, x, x)
+        # 重塑形状，准备输入卷积层
+        x = x.view(x.size(0), x.size(1), 224, 224)
+        # 卷积层判断图像真伪
+        x = self.conv_layers(x)
+        return x
+
+
+# 训练函数
+def train_tgan(generator, discriminator, train_loader, epochs, lr=0.0001, betas=(0.5, 0.9)):
+    criterion = nn.BCELoss()
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=betas)
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=betas)
+
+    for epoch in range(epochs):
+        epoch_d_loss = 0.0
+        epoch_g_loss = 0.0
+        num_batches = 0
+        for i, (real_images, labels) in enumerate(train_loader):
+            batch_size = real_images.size(0)
+            real_labels = torch.ones((batch_size, 1, 1, 1))
+            fake_labels = torch.zeros((batch_size, 1, 1, 1))
+
+            # 训练判别器
+            optimizer_D.zero_grad()
+            noise = torch.randn((batch_size, 100, 1, 1))
+            label_emb = discriminator.embedding(labels)
+            fake_images = generator(noise, label_emb)
+            real_output = discriminator(real_images, labels)
+            fake_output = discriminator(fake_images.detach(), labels)
+            real_loss = criterion(real_output, real_labels)
+            fake_loss = criterion(fake_output, fake_labels)
+            d_loss = real_loss + fake_loss
+            d_loss.backward()
+            optimizer_D.step()
+
+            # 训练生成器
+            optimizer_G.zero_grad()
+            fake_output = discriminator(fake_images, labels)
+            g_loss = criterion(fake_output, real_labels)
+            g_loss.backward()
+            optimizer_G.step()
+
+            epoch_d_loss += d_loss.item()
+            epoch_g_loss += g_loss.item()
+            num_batches += 1
+
+        avg_d_loss = epoch_d_loss / num_batches
+        avg_g_loss = epoch_g_loss / num_batches
+        print(f'Epoch [{epoch + 1}/{epochs}] - D_loss: {avg_d_loss:.4f}, G_loss: {avg_g_loss:.4f}')
+
+
+# 生成样本函数
+def generate_samples(generator, num_samples, latent_dim=100, label_dim=50):
+    noise = torch.randn((num_samples, latent_dim, 1, 1))
+    labels = torch.randint(0, 10, (num_samples,))
+    label_emb = generator.embedding(labels)
+    generated_images = generator(noise, label_emb)
+    return generated_images
+
+
+# 假设已有预处理后的数据和标签
+# data: [N, C, H, W]，这里简化为随机数据
+# labels: [N]
+num_samples = 7256
+data = np.random.rand(num_samples, 1, 224, 224).astype(np.float32)
+labels = np.random.randint(0, 10, num_samples)
+
+# 划分训练集和测试集
+train_data = data[:int(num_samples * 0.8)]
+train_labels = labels[:int(num_samples * 0.8)]
+test_data = data[int(num_samples * 0.8):]
+test_labels = labels[int(num_samples * 0.8):]
+
+# 数据预处理
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+# 创建数据集和数据加载器
+train_dataset = PageLayoutDataset(train_data, train_labels, transform)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+# 初始化模型
+generator = TGANGenerator()
+discriminator = TGANDiscriminator()
+
+# 训练模型
+train_tgan(generator, discriminator, train_loader, epochs=50)
+
+# 生成样本
+generated_images = generate_samples(generator, num_samples=16)
+
+# 可视化生成的样本
+def visualize_samples(generated_images):
+    fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+    for i, ax in enumerate(axes.flat):
+        ax.imshow(generated_images[i, 0].detach().numpy(), cmap='gray')
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+visualize_samples(generated_images)
+
+
+# 评估函数
+def evaluate_model(generator, discriminator, test_loader):
+    generator.eval()
+    discriminator.eval()
+    real_outputs = []
+    fake_outputs = []
+    with torch.no_grad():
+        for real_images, labels in test_loader:
+            noise = torch.randn((real_images.size(0), 100, 1, 1))
+            label_emb = discriminator.embedding(labels)
+            fake_images = generator(noise, label_emb)
+            real_out = discriminator(real_images, labels)
+            fake_out = discriminator(fake_images, labels)
+            real_outputs.extend(real_out.squeeze().tolist())
+            fake_outputs.extend(fake_out.squeeze().tolist())
+    real_outputs = np.array(real_outputs)
+    fake_outputs = np.array(fake_outputs)
+    # 计算判别器在真实图像上的平均输出
+    avg_real_output = np.mean(real_outputs)
+    # 计算判别器在生成图像上的平均输出
+    avg_fake_output = np.mean(fake_outputs)
+    # 计算判别器的准确性
+    real_accuracy = np.mean(real_outputs > 0.5)
+    fake_accuracy = np.mean(fake_outputs < 0.5)
+    print(f'Average Real Output: {avg_real_output:.4f}, Average Fake Output: {avg_fake_output:.4f}')
+    print(f'Real Accuracy: {real_accuracy:.4f}, Fake Accuracy: {fake_accuracy:.4f}')
+
+
+# 创建测试数据集和数据加载器
+test_dataset = PageLayoutDataset(test_data, test_labels, transform)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+# 评估模型
+evaluate_model(generator, discriminator, test_loader)
